@@ -1,0 +1,168 @@
+# 自动汉化构建: 跟随上游最新正式版 -> 可选 AI 补译 -> 注入汉化 -> 构建 Windows 安装包 -> 发布到本仓库 Releases。
+# 应用内"检查更新"会读取本仓库的 latest.yml, 中文版因此可以自动更新到下一版中文版。
+name: Build KopiaUI zh-CN
+
+on:
+  # 手动触发(随时可重建)
+  workflow_dispatch:
+  # 字典或本工作流有改动时自动重建
+  push:
+    paths:
+      - "l10n/**"
+      - ".github/workflows/build-zh-cn.yml"
+  # 每天 UTC 19:30(北京时间 03:30)检查上游是否发布了新版本
+  schedule:
+    - cron: "30 19 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-zh-cn
+  cancel-in-progress: false
+
+env:
+  # kopia 的 Makefile 在 Windows 上要求该变量(决定 mkdir/mv 的写法)
+  UNIX_SHELL_ON_WINDOWS: "true"
+  UPSTREAM_REPO: kopia/kopia
+
+jobs:
+  check:
+    name: 检查上游版本
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - name: 解析上游最新正式版
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          echo "上游最新版本: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          build=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "本仓库已发布 $TAG, 定时任务跳过"
+              build=false
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: 汉化构建 (Windows)
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 git 身份(合并上游/提交字典需要)
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 合并上游 ${{ needs.check.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" "refs/tags/${TAG}"
+          git merge --no-edit FETCH_HEAD
+
+      - name: 安装 Node(仅 l10n 脚本使用, 构建用的 Node 由 kopia Makefile 自行下载)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 安装构建工具 make/zip/curl
+        shell: bash
+        run: choco install --no-progress -y make zip unzip curl
+
+      - name: 提取待翻译字符串(对照 kopia/htmlui 源码)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/kopia/htmlui.git ../htmlui-src
+          node l10n/extract.mjs ../htmlui-src --dict l10n/zh-CN.json --out .l10n-reports/missing.json
+
+      - name: 自动翻译(可选; 未配置 TRANSLATE_API_KEY 时自动跳过)
+        shell: bash
+        env:
+          TRANSLATE_API_KEY: ${{ secrets.TRANSLATE_API_KEY }}
+          TRANSLATE_BASE_URL: ${{ vars.TRANSLATE_BASE_URL }}
+          TRANSLATE_MODEL: ${{ vars.TRANSLATE_MODEL }}
+        run: node l10n/autotranslate.mjs --missing .l10n-reports/missing.json --dict l10n/zh-CN.json
+
+      - name: 提交字典更新并推送
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add l10n/zh-CN.json
+          if git diff --cached --quiet; then
+            echo "字典无变化"
+          else
+            git commit -m "chore(l10n): 同步 ${TAG} 并自动翻译新字符串"
+          fi
+          git push origin HEAD
+
+      - name: 注入汉化(改 app/public/preload.js 与 electron.js)
+        shell: bash
+        run: node l10n/apply.mjs --emit .l10n-reports/zh-cn.inject.js
+
+      - name: 构建 kopia 服务端二进制
+        shell: bash
+        run: make kopia KOPIA_VERSION="${TAG}"
+
+      - name: 安装 UI 构建依赖
+        shell: bash
+        run: |
+          make go-modules
+          make app-node-modules
+
+      - name: 构建 KopiaUI 安装包
+        shell: bash
+        run: make kopia-ui KOPIA_VERSION="${TAG}"
+
+      - name: 上传构建产物与翻译报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: KopiaUI-zh-CN-${{ needs.check.outputs.tag }}
+          path: |
+            dist/kopia-ui/KopiaUI-Setup-*.exe
+            dist/kopia-ui/*.zip
+            dist/kopia-ui/*.yml
+            .l10n-reports/missing.json
+          if-no-files-found: error
+
+      - name: 发布 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              --title "KopiaUI 简体中文 ${TAG}" \
+              --notes "自动构建: 基于上游 ${TAG}, 已注入简体中文界面。安装包未做代码签名, 首次运行若出现 SmartScreen 提示请选择「仍要运行」。"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            dist/kopia-ui/KopiaUI-Setup-*.exe \
+            dist/kopia-ui/*.zip
+          if [ -f dist/kopia-ui/latest.yml ]; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/kopia-ui/latest.yml
+          fi
