@@ -90,9 +90,44 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: 安装构建工具 make/zip/curl
+      - name: 准备构建工具(make/zip, 不依赖 chocolatey 社区源)
         shell: bash
-        run: choco install --no-progress -y make zip unzip curl
+        run: |
+          set -euo pipefail
+          # GNU make 已预装在 GitHub Windows 镜像里
+          if ! command -v make >/dev/null 2>&1; then
+            echo "未找到 make, 尝试通过 chocolatey 安装"
+            choco install --no-progress -y make
+          fi
+          # kopia 的 Makefile 打包 CLI zip 时需要 zip; 镜像未预装, 用 7-Zip 做兼容垫片
+          # (chocolatey 社区源会 503, 不能依赖)
+          if ! command -v zip >/dev/null 2>&1; then
+            if [ ! -f "/c/Program Files/7-Zip/7z.exe" ]; then
+              echo "未找到 7-Zip, 尝试通过 chocolatey 安装 zip"
+              choco install --no-progress -y zip
+            fi
+            if ! command -v zip >/dev/null 2>&1; then
+              SHIM_DIR="$(cygpath -u "$RUNNER_TEMP")/zh-cn-bin"
+              mkdir -p "$SHIM_DIR"
+              {
+                echo '#!/usr/bin/env bash'
+                echo '# zip 兼容垫片: 用 7-Zip 实现 Makefile 用到的 `zip -r out.zip item...`'
+                echo 'out="$1"; shift'
+                echo 'items=()'
+                echo 'for a in "$@"; do case "$a" in -*) ;; *) items+=("$a") ;; esac; done'
+                echo 'exec "/c/Program Files/7-Zip/7z.exe" a -tzip "$out" "${items[@]}"'
+              } > "$SHIM_DIR/zip"
+              chmod +x "$SHIM_DIR/zip"
+              echo "$SHIM_DIR" >> "$GITHUB_PATH"
+              # 自检: 立刻用垫片打一个测试 zip, 有问题就在这一步失败
+              T="$(mktemp -d)"
+              (cd "$T" && mkdir -p d && touch d/a.txt && "$SHIM_DIR/zip" -r out.zip d >/dev/null && test -s out.zip)
+              rm -rf "$T"
+              echo "zip 垫片已创建并自检通过: $SHIM_DIR/zip"
+            fi
+          fi
+          command -v make >/dev/null 2>&1 && echo "make: $(command -v make)" || { echo "make 不可用"; exit 1; }
+          echo "zip: $(command -v zip 2>/dev/null || echo '垫片将于后续步骤生效')"
 
       - name: 提取待翻译字符串(对照 kopia/htmlui 源码)
         shell: bash
@@ -127,7 +162,11 @@ jobs:
 
       - name: 构建 kopia 服务端二进制
         shell: bash
-        run: make kopia KOPIA_VERSION="${TAG}"
+        run: |
+          set -euo pipefail
+          # 垫片目录兜底注入 PATH(GITHUB_PATH 已加过一次, 这里再显式保证)
+          export PATH="$(cygpath -u "$RUNNER_TEMP")/zh-cn-bin:$PATH"
+          make kopia KOPIA_VERSION="${TAG}"
 
       - name: 安装 UI 构建依赖
         shell: bash
